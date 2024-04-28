@@ -20,21 +20,22 @@ from rsl_rl.utils import store_code_state
 class OnPolicyRunner:
     """On-policy runner for training and evaluation."""
 
-    def __init__(self, env: VecEnv, train_cfg, log_dir=None, device="cpu"):
+    def __init__(self, env: VecEnv, train_cfg, latent_model: str, log_dir=None, device="cpu"):
         self.cfg = train_cfg
         self.alg_cfg = train_cfg["algorithm"]
         self.policy_cfg = train_cfg["policy"]
         self.device = device
         self.env = env
+
         obs, extras = self.env.get_observations()
-        num_obs = obs.shape[1]
+        num_obs = self.cfg["num_obs"]   # Muye --> the output shape of cmd latent
         if "critic" in extras["observations"]:
             num_critic_obs = extras["observations"]["critic"].shape[1]
         else:
             num_critic_obs = num_obs
         actor_critic_class = eval(self.policy_cfg.pop("class_name"))  # ActorCritic
         actor_critic: ActorCritic | ActorCriticRecurrent = actor_critic_class(
-            num_obs, num_critic_obs, self.env.num_actions, **self.policy_cfg
+            num_obs, num_obs, self.env.num_actions, visual_latent=latent_model, **self.policy_cfg
         ).to(self.device)
         alg_class = eval(self.alg_cfg.pop("class_name"))  # PPO
         self.alg: PPO = alg_class(actor_critic, device=self.device, **self.alg_cfg)
@@ -51,8 +52,8 @@ class OnPolicyRunner:
         self.alg.init_storage(
             self.env.num_envs,
             self.num_steps_per_env,
-            [num_obs],
-            [num_critic_obs],
+            [1, 2, 50, 50],  # Muye --> this is the original obs shape, NOT obs latent
+            [1, 2, 50, 50],
             [self.env.num_actions],
         )
 
@@ -96,11 +97,13 @@ class OnPolicyRunner:
         self.train_mode()  # switch to train mode (for dropout for example)
 
         ep_infos = []
+        infos = {}
         rewbuffer = deque(maxlen=100)
         lenbuffer = deque(maxlen=100)
         cur_reward_sum = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
         cur_episode_length = torch.zeros(self.env.num_envs, dtype=torch.float, device=self.device)
 
+        trainee_rew, cap_area_rew = None, None
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
@@ -109,18 +112,20 @@ class OnPolicyRunner:
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
                     actions = self.alg.act(obs, critic_obs)
+
                     obs, rewards, dones, infos = self.env.step(actions)
+                    trainee_rew = infos["trainee_rew"]
+                    cap_area_rew = infos["cap_area_rew"]
                     obs = self.obs_normalizer(obs)
-                    if "critic" in infos["observations"]:
-                        critic_obs = self.critic_obs_normalizer(infos["observations"]["critic"])
-                    else:
-                        critic_obs = obs
+                    critic_obs = obs
+
                     obs, critic_obs, rewards, dones = (
                         obs.to(self.device),
                         critic_obs.to(self.device),
                         rewards.to(self.device),
                         dones.to(self.device),
                     )
+
                     self.alg.process_env_step(rewards, dones, infos)
 
                     if self.log_dir is not None:
@@ -146,7 +151,9 @@ class OnPolicyRunner:
                 start = stop
                 self.alg.compute_returns(critic_obs)
 
-            mean_value_loss, mean_surrogate_loss = self.alg.update()
+            #mean_value_loss, mean_surrogate_loss, actor_grad, critic_grad = self.alg.update()
+            mean_value_loss, mean_surrogate_loss = self.alg.update() 
+            
             stop = time.time()
             learn_time = stop - start
             self.current_learning_iteration = it
@@ -194,13 +201,18 @@ class OnPolicyRunner:
         mean_std = self.alg.actor_critic.std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs["collection_time"] + locs["learn_time"]))
 
+        #self.writer.add_scalar("Loss/actor_grad", locs["actor_grad"], locs["it"])
+        #self.writer.add_scalar("Loss/critic_grad", locs["critic_grad"], locs["it"])
+        self.writer.add_scalar("Loss/trainee_rew", locs["trainee_rew"], locs["it"])
+        self.writer.add_scalar("Loss/cap_area_rew", locs["cap_area_rew"], locs["it"])
+
         self.writer.add_scalar("Loss/value_function", locs["mean_value_loss"], locs["it"])
         self.writer.add_scalar("Loss/surrogate", locs["mean_surrogate_loss"], locs["it"])
         self.writer.add_scalar("Loss/learning_rate", self.alg.learning_rate, locs["it"])
         self.writer.add_scalar("Policy/mean_noise_std", mean_std.item(), locs["it"])
-        self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
-        self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
-        self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
+        # self.writer.add_scalar("Perf/total_fps", fps, locs["it"])
+        # self.writer.add_scalar("Perf/collection time", locs["collection_time"], locs["it"])
+        # self.writer.add_scalar("Perf/learning_time", locs["learn_time"], locs["it"])
         if len(locs["rewbuffer"]) > 0:
             self.writer.add_scalar("Train/mean_reward", statistics.mean(locs["rewbuffer"]), locs["it"])
             self.writer.add_scalar("Train/mean_episode_length", statistics.mean(locs["lenbuffer"]), locs["it"])
@@ -212,6 +224,7 @@ class OnPolicyRunner:
 
         str = f" \033[1m Learning iteration {locs['it']}/{locs['tot_iter']} \033[0m "
 
+        rew_dict = locs["infos"]
         if len(locs["rewbuffer"]) > 0:
             log_string = (
                 f"""{'#' * width}\n"""
@@ -224,8 +237,6 @@ class OnPolicyRunner:
                 f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                 f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n"""
             )
-            #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
-            #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
         else:
             log_string = (
                 f"""{'#' * width}\n"""
